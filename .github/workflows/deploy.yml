@@ -1,24 +1,21 @@
-name: Build Deploy MERN E-Commerce
+name: Build and Deploy MERN E-Commerce to EC2 Docker
 
 on:
   push:
-    branches: [master]
+    branches: [main]
   workflow_dispatch:
 
 env:
   AWS_REGION: ap-south-1
-  ECR_REPOSITORY: mern-ecommerce
   ECR_REGISTRY: 759204735992.dkr.ecr.ap-south-1.amazonaws.com
-  INSTANCE_ID: i-038c8a6e7710be5b0
-  CONTAINER_PORT: "5000"
+  ECR_REPOSITORY: mern-ecommerce
+  INSTANCE_ID: i-0d7c06ce4178de35a
+  SECRETS_ID: deptic/mern-ecommerce/secrets
   PUBLIC_URL: http://13.205.95.100
-  SECRETS_MANAGER_ID: deptic/mern-ecommerce/secrets
 
 jobs:
-  build-and-push:
+  build-and-deploy:
     runs-on: ubuntu-latest
-    outputs:
-      image_uri: ${{ steps.image.outputs.image_uri }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -26,92 +23,88 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: "20"
 
-      - name: Install dependencies
-        run: npm ci || npm install
-
-      - name: Build diagnostics
+      - name: Configure AWS credentials
         run: |
-          echo "Node version: $(node --version)"
-          echo "NPM version: $(npm --version)"
-          npm run build || echo "No build step or build skipped (server app)"
-          ls -la
+          export AWS_ACCESS_KEY_ID="${{ secrets.AWS_ACCESS_KEY_ID }}"
+          export AWS_SECRET_ACCESS_KEY="${{ secrets.AWS_SECRET_ACCESS_KEY }}"
+          export AWS_DEFAULT_REGION="$AWS_REGION"
+          echo "AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }}" >> $GITHUB_ENV
+          echo "AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }}" >> $GITHUB_ENV
+          echo "AWS_DEFAULT_REGION=$AWS_REGION" >> $GITHUB_ENV
 
-      - name: Configure AWS credentials via CLI env
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Compute image URI
         run: |
-          aws configure set aws_access_key_id "$AWS_ACCESS_KEY_ID"
-          aws configure set aws_secret_access_key "$AWS_SECRET_ACCESS_KEY"
-          aws configure set region "$AWS_REGION"
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          FULL_IMAGE="$ECR_REGISTRY/$ECR_REPOSITORY"
+          echo "IMAGE_URI=$FULL_IMAGE:${{ github.sha }}" >> $GITHUB_ENV
+          echo "IMAGE_URI_LATEST=$FULL_IMAGE:latest" >> $GITHUB_ENV
 
-      - name: Login to ECR
+      - name: Login to Amazon ECR
         run: |
           aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$ECR_REGISTRY"
 
-      - name: Set up Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Build and push image
-        id: image
+      - name: Build image
         run: |
-          FULL_IMAGE="$ECR_REGISTRY/$ECR_REPOSITORY"
-          docker build -t "$FULL_IMAGE:latest" -t "$FULL_IMAGE:${{ github.sha }}" .
-          docker push "$FULL_IMAGE:latest"
-          docker push "$FULL_IMAGE:${{ github.sha }}"
-          echo "image_uri=$FULL_IMAGE:${{ github.sha }}" >> "$GITHUB_OUTPUT"
+          docker build -t "$IMAGE_URI" -t "$IMAGE_URI_LATEST" -f Dockerfile .
+          docker image inspect "$IMAGE_URI" > /dev/null && echo "Build diagnostics: image built successfully"
+          docker images | head -5
 
-  deploy:
-    runs-on: ubuntu-latest
-    needs: build-and-push
-    steps:
-      - name: Configure AWS credentials via CLI env
+      - name: Push image
         run: |
-          aws configure set aws_access_key_id "$AWS_ACCESS_KEY_ID"
-          aws configure set aws_secret_access_key "$AWS_SECRET_ACCESS_KEY"
-          aws configure set region "$AWS_REGION"
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          docker push "$IMAGE_URI"
+          docker push "$IMAGE_URI_LATEST"
 
       - name: Deploy to EC2 via SSM
         run: |
-          REGION="ap-south-1"
-          INSTANCE_ID="i-038c8a6e7710be5b0"
-          ECR_REGISTRY="759204735992.dkr.ecr.ap-south-1.amazonaws.com"
-          IMAGE_URI="${{ needs.build-and-push.outputs.image_uri }}"
-          SECRETS_JSON=$(aws secretsmanager get-secret-value --secret-id "deptic/mern-ecommerce/secrets" --region "$REGION" --query SecretString --output text)
-          echo "$SECRETS_JSON" > /tmp/app-secrets.json
-
+          REGION="$AWS_REGION"
+          INSTANCE="$INSTANCE_ID"
+          ECR_REGISTRY_VAL="$ECR_REGISTRY"
+          IMAGE="$IMAGE_URI"
+          SECRETS="$SECRETS_ID"
           cat > /tmp/ssm-params.json << SSMPARAMS
           {
             "commands": [
-              "aws ecr get-login-password --region $REGION | docker login --username AWS --password-stdin $ECR_REGISTRY",
-              "docker pull $IMAGE_URI",
+              "set -e",
+              "aws ecr get-login-password --region ${REGION} | docker login --username AWS --password-stdin ${ECR_REGISTRY_VAL}",
+              "aws secretsmanager get-secret-value --secret-id ${SECRETS} --region ${REGION} --query SecretString --output text > /tmp/app.env",
+              "echo 'PORT=5000' >> /tmp/app.env",
+              "echo 'NODE_ENV=production' >> /tmp/app.env",
+              "echo 'CLIENT_URL=${PUBLIC_URL}' >> /tmp/app.env",
+              "docker pull ${IMAGE}",
               "docker stop app || true",
               "docker rm app || true",
-              "docker run -d --restart always --name app -p 80:5000 --env-file /home/ec2-user/.app.env $IMAGE_URI"
+              "docker run -d --restart always -p 80:80 --env-file /tmp/app.env --name app ${IMAGE}",
+              "rm -f /tmp/app.env",
+              "sleep 15",
+              "docker ps --filter name=app"
             ]
           }
           SSMPARAMS
-
-          COMMAND_ID=$(aws ssm send-command --instance-ids "$INSTANCE_ID" --region "$REGION" --document-name "AWS-RunShellScript" --parameters file:///tmp/ssm-params.json --query "Command.CommandId" --output text)
-          aws ssm wait command-executed --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --region "$REGION"
-          STATUS=$(aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --region "$REGION" --query Status --output text)
-          if [ "$STATUS" != "Success" ]; then
-            aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --region "$REGION" --query Output
-            exit 1
-          fi
+          COMMAND_ID=$(aws ssm send-command --instance-ids "$INSTANCE" --region "$REGION" --document-name "AWS-RunShellScript" --parameters file:///tmp/ssm-params.json --query "Command.CommandId" --output text)
+          echo "SSM command id: $COMMAND_ID"
+          for i in $(seq 1 30); do
+            STATUS=$(aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE" --region "$REGION" --query Status --output text)
+            echo "Attempt $i status: $STATUS"
+            if [ "$STATUS" = "Success" ]; then break; fi
+            if [ "$STATUS" = "Failed" ] || [ "$STATUS" = "Cancelled" ] || [ "$STATUS" = "TimedOut" ]; then
+              aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE" --region "$REGION"
+              exit 1
+            fi
+            sleep 10
+          done
+          [ "$STATUS" = "Success" ] || exit 1
 
       - name: Health check
         run: |
-          for i in $(seq 1 15); do
-            CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://13.205.95.100" || true)
-            echo "Attempt $i: HTTP $CODE"
+          for i in $(seq 1 20); do
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" "$PUBLIC_URL" || echo "000")
+            echo "Health check attempt $i -> HTTP $CODE"
             if [ "$CODE" = "200" ]; then
-              echo "Deployment healthy"
+              echo "Deployment healthy at $PUBLIC_URL"
               exit 0
             fi
             sleep 10
