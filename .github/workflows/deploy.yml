@@ -9,18 +9,18 @@ env:
   AWS_REGION: ap-south-1
   ECR_REGISTRY: 759204735992.dkr.ecr.ap-south-1.amazonaws.com
   ECR_REPOSITORY: mern-ecommerce
-  INSTANCE_ID: i-0d7c06ce4178de35a
-  SECRETS_ID: deptic/mern-ecommerce/secrets
+  INSTANCE_ID: i-038c8a6e7710be5b0
   PUBLIC_URL: http://13.205.95.100
+  HEALTH_URL: http://13.205.95.100
 
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
+      - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Setup Node
+      - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
           node-version: "20"
@@ -29,85 +29,61 @@ jobs:
         run: |
           export AWS_ACCESS_KEY_ID="${{ secrets.AWS_ACCESS_KEY_ID }}"
           export AWS_SECRET_ACCESS_KEY="${{ secrets.AWS_SECRET_ACCESS_KEY }}"
-          export AWS_DEFAULT_REGION="$AWS_REGION"
-          echo "AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }}" >> $GITHUB_ENV
-          echo "AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }}" >> $GITHUB_ENV
-          echo "AWS_DEFAULT_REGION=$AWS_REGION" >> $GITHUB_ENV
+          aws sts get-caller-identity --region "$AWS_REGION"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Compute image URI
+      - name: Build Docker image (with diagnostics)
         run: |
           FULL_IMAGE="$ECR_REGISTRY/$ECR_REPOSITORY"
-          echo "IMAGE_URI=$FULL_IMAGE:${{ github.sha }}" >> $GITHUB_ENV
-          echo "IMAGE_URI_LATEST=$FULL_IMAGE:latest" >> $GITHUB_ENV
-
-      - name: Login to Amazon ECR
-        run: |
-          aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$ECR_REGISTRY"
-
-      - name: Build image
-        run: |
-          docker build -t "$IMAGE_URI" -t "$IMAGE_URI_LATEST" -f Dockerfile .
-          docker image inspect "$IMAGE_URI" > /dev/null && echo "Build diagnostics: image built successfully"
+          echo "Building image: $FULL_IMAGE:${GITHUB_SHA::8}"
+          docker build -t "$FULL_IMAGE:${GITHUB_SHA::8}" -t "$FULL_IMAGE:latest" \
+            -f "$GITHUB_WORKSPACE/Dockerfile" "$GITHUB_WORKSPACE" \
+            || { echo "::error::Docker build failed"; docker system df; exit 1; }
           docker images | head -5
 
-      - name: Push image
+      - name: Push image to ECR
         run: |
-          docker push "$IMAGE_URI"
-          docker push "$IMAGE_URI_LATEST"
+          export AWS_ACCESS_KEY_ID="${{ secrets.AWS_ACCESS_KEY_ID }}"
+          export AWS_SECRET_ACCESS_KEY="${{ secrets.AWS_SECRET_ACCESS_KEY }}"
+          FULL_IMAGE="$ECR_REGISTRY/$ECR_REPOSITORY"
+          aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+          docker push "$FULL_IMAGE:${GITHUB_SHA::8}"
+          docker push "$FULL_IMAGE:latest"
 
       - name: Deploy to EC2 via SSM
         run: |
-          REGION="$AWS_REGION"
-          INSTANCE="$INSTANCE_ID"
-          ECR_REGISTRY_VAL="$ECR_REGISTRY"
-          IMAGE="$IMAGE_URI"
-          SECRETS="$SECRETS_ID"
-          cat > /tmp/ssm-params.json << SSMPARAMS
+          export AWS_ACCESS_KEY_ID="${{ secrets.AWS_ACCESS_KEY_ID }}"
+          export AWS_SECRET_ACCESS_KEY="${{ secrets.AWS_SECRET_ACCESS_KEY }}"
+          FULL_IMAGE="$ECR_REGISTRY/$ECR_REPOSITORY:latest"
+          cat > /tmp/ssm-params.json << 'SSMPARAMS'
           {
             "commands": [
-              "set -e",
-              "aws ecr get-login-password --region ${REGION} | docker login --username AWS --password-stdin ${ECR_REGISTRY_VAL}",
-              "aws secretsmanager get-secret-value --secret-id ${SECRETS} --region ${REGION} --query SecretString --output text > /tmp/app.env",
-              "echo 'PORT=5000' >> /tmp/app.env",
-              "echo 'NODE_ENV=production' >> /tmp/app.env",
-              "echo 'CLIENT_URL=${PUBLIC_URL}' >> /tmp/app.env",
-              "docker pull ${IMAGE}",
+              "aws ecr get-login-password --region ap-south-1 | docker login --username AWS --password-stdin 759204735992.dkr.ecr.ap-south-1.amazonaws.com",
+              "docker pull 759204735992.dkr.ecr.ap-south-1.amazonaws.com/mern-ecommerce:latest",
               "docker stop app || true",
               "docker rm app || true",
-              "docker run -d --restart always -p 80:80 --env-file /tmp/app.env --name app ${IMAGE}",
-              "rm -f /tmp/app.env",
-              "sleep 15",
-              "docker ps --filter name=app"
+              "docker run -d --restart always -p 80:80 --name app 759204735992.dkr.ecr.ap-south-1.amazonaws.com/mern-ecommerce:latest"
             ]
           }
           SSMPARAMS
-          COMMAND_ID=$(aws ssm send-command --instance-ids "$INSTANCE" --region "$REGION" --document-name "AWS-RunShellScript" --parameters file:///tmp/ssm-params.json --query "Command.CommandId" --output text)
-          echo "SSM command id: $COMMAND_ID"
-          for i in $(seq 1 30); do
-            STATUS=$(aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE" --region "$REGION" --query Status --output text)
-            echo "Attempt $i status: $STATUS"
-            if [ "$STATUS" = "Success" ]; then break; fi
-            if [ "$STATUS" = "Failed" ] || [ "$STATUS" = "Cancelled" ] || [ "$STATUS" = "TimedOut" ]; then
-              aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE" --region "$REGION"
-              exit 1
-            fi
-            sleep 10
-          done
-          [ "$STATUS" = "Success" ] || exit 1
+          COMMAND_ID=$(aws ssm send-command --instance-ids "$INSTANCE_ID" --region "$AWS_REGION" --document-name "AWS-RunShellScript" --parameters file:///tmp/ssm-params.json --query "Command.CommandId" --output text)
+          echo "SSM Command ID: $COMMAND_ID"
+          aws ssm wait command-executed --instance-id "$INSTANCE_ID" --command-id "$COMMAND_ID" --region "$AWS_REGION"
+          aws ssm get-command-invocation --instance-id "$INSTANCE_ID" --command-id "$COMMAND_ID" --region "$AWS_REGION" --query "{Status:Status,Output:Output,Error:StandardErrorContent}" --output text
 
-      - name: Health check
+      - name: Health check (must return HTTP 200)
         run: |
-          for i in $(seq 1 20); do
-            CODE=$(curl -s -o /dev/null -w "%{http_code}" "$PUBLIC_URL" || echo "000")
-            echo "Health check attempt $i -> HTTP $CODE"
+          echo "Verifying deployment at $HEALTH_URL"
+          for i in $(seq 1 15); do
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$HEALTH_URL" || echo "000")
+            echo "Attempt $i: HTTP $CODE"
             if [ "$CODE" = "200" ]; then
-              echo "Deployment healthy at $PUBLIC_URL"
+              echo "Health check passed."
               exit 0
             fi
-            sleep 10
+            sleep 15
           done
-          echo "Health check failed"
+          echo "::error::Health check failed at $HEALTH_URL"
           exit 1
