@@ -1,0 +1,153 @@
+name: Build and Deploy MERN E-Commerce to EC2 Docker
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  AWS_REGION: ap-south-1
+  ECR_REPOSITORY: mern-ecommerce
+  ECR_REGISTRY: 759204735992.dkr.ecr.ap-south-1.amazonaws.com
+  INSTANCE_ID: i-013f14279a0433c48
+  SECRETS_ID: deptic/mern-ecommerce/secrets
+  CONTAINER_PORT: "5000"
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Build application
+        run: npm run build
+
+      - name: Build diagnostics
+        run: |
+          echo "=== Build diagnostics ==="
+          echo "Git SHA: $GITHUB_SHA"
+          echo "Node version: $(node --version)"
+          echo "npm version: $(npm --version)"
+          echo "Workspace contents:"
+          ls -la
+          if [ -f Dockerfile ]; then
+            echo "--- Dockerfile ---"
+            cat Dockerfile
+          else
+            echo "WARNING: No Dockerfile found at repository root"
+          fi
+          if [ -d dist ]; then
+            echo "--- dist contents ---"
+            ls -la dist
+          fi
+
+      - name: Configure AWS credentials
+        run: |
+          export AWS_ACCESS_KEY_ID="${{ secrets.AWS_ACCESS_KEY_ID }}"
+          export AWS_SECRET_ACCESS_KEY="${{ secrets.AWS_SECRET_ACCESS_KEY }}"
+          aws sts get-caller-identity --region "$AWS_REGION"
+
+      - name: Build and push Docker image to ECR
+        run: |
+          export AWS_ACCESS_KEY_ID="${{ secrets.AWS_ACCESS_KEY_ID }}"
+          export AWS_SECRET_ACCESS_KEY="${{ secrets.AWS_SECRET_ACCESS_KEY }}"
+          FULL_IMAGE="$ECR_REGISTRY/$ECR_REPOSITORY"
+          echo "FULL_IMAGE=$FULL_IMAGE" >> "$GITHUB_ENV"
+          aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+          docker build -t "$FULL_IMAGE:latest" -t "$FULL_IMAGE:${GITHUB_SHA::7}" .
+          docker push "$FULL_IMAGE:latest"
+          docker push "$FULL_IMAGE:${GITHUB_SHA::7}"
+
+      - name: Deploy to EC2 via SSM
+        run: |
+          export AWS_ACCESS_KEY_ID="${{ secrets.AWS_ACCESS_KEY_ID }}"
+          export AWS_SECRET_ACCESS_KEY="${{ secrets.AWS_SECRET_ACCESS_KEY }}"
+          FULL_IMAGE="$ECR_REGISTRY/$ECR_REPOSITORY"
+          REGION="$AWS_REGION"
+          INSTANCE_ID="$INSTANCE_ID"
+
+          # Fetch application secrets from Secrets Manager into an env file
+          aws secretsmanager get-secret-value \
+            --secret-id "$SECRETS_ID" \
+            --region "$REGION" \
+            --query SecretString --output text > /tmp/app-secrets.json
+
+          python3 - << 'PYEOF'
+          import json
+          with open("/tmp/app-secrets.json") as f:
+              secrets = json.load(f)
+          approved = [
+              "ACCESS_TOKEN_SECRET", "CLIENT_URL", "CLOUDINARY_API_KEY",
+              "CLOUDINARY_API_SECRET", "CLOUDINARY_CLOUD_NAME", "MONGO_URI",
+              "NODE_ENV", "PORT", "REFRESH_TOKEN_SECRET",
+              "STRIPE_SECRET_KEY", "UPSTASH_REDIS_URL"
+          ]
+          with open("/tmp/app.env", "w") as f:
+              for key in approved:
+                  if key in secrets:
+                      f.write(f"{key}={secrets[key]}\n")
+          PYEOF
+
+          # Base64-encode the env file so it can be materialized on the instance
+          ENV_B64=$(base64 -w 0 /tmp/app.env)
+
+          cat > /tmp/ssm-params.json << SSMPARAMS
+          {
+            "commands": [
+              "aws ecr get-login-password --region $REGION | docker login --username AWS --password-stdin $ECR_REGISTRY",
+              "docker pull $FULL_IMAGE:latest",
+              "docker stop app || true",
+              "docker rm app || true",
+              "echo $ENV_B64 | base64 -d > /tmp/app.env",
+              "docker run -d --restart always -p 80:$CONTAINER_PORT --env-file /tmp/app.env --name app $FULL_IMAGE:latest",
+              "rm -f /tmp/app.env",
+              "sleep 5",
+              "docker ps --filter name=app"
+            ]
+          }
+          SSMPARAMS
+
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --region "$REGION" \
+            --document-name "AWS-RunShellScript" \
+            --parameters file:///tmp/ssm-params.json \
+            --query "Command.CommandId" --output text)
+
+          echo "SSM Command ID: $COMMAND_ID"
+          aws ssm wait command-executed \
+            --command-id "$COMMAND_ID" \
+            --instance-id "$INSTANCE_ID" \
+            --region "$REGION" || true
+
+          aws ssm get-command-invocation \
+            --command-id "$COMMAND_ID" \
+            --instance-id "$INSTANCE_ID" \
+            --region "$REGION" \
+            --query "{Status:Status,Output:Output,Error:StandardErrorContent}" \
+            --output text
+
+      - name: Health check
+        run: |
+          HEALTH_URL="http://15.207.190.237"
+          echo "Checking health at $HEALTH_URL"
+          for i in $(seq 1 15); do
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$HEALTH_URL" || echo "000")
+            echo "Attempt $i: HTTP $HTTP_CODE"
+            if [ "$HTTP_CODE" = "200" ]; then
+              echo "Health check passed."
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "Health check failed: $HEALTH_URL did not return HTTP 200."
+          exit 1
